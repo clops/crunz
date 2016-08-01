@@ -19,6 +19,13 @@ class Event
     public $command;
 
     /**
+     * Process that runs the event
+     *
+     * @var Symfony\Component\Process\Process
+     */
+    public $process;
+
+    /**
      * The cron expression representing the event's frequency.
      *
      * @var string
@@ -65,7 +72,7 @@ class Event
      *
      * @var string
      */
-    public $output = '/dev/null';
+    protected $output = '/dev/null';
 
     /**
      * Indicates whether output should be appended.
@@ -147,18 +154,24 @@ class Event
       */
     public function run(Invoker $invoker)
     {
-        if (count($this->beforeCallbacks)) {
-            $this->callBeforeCallbacks($invoker);
+        // Starting the process asynchronously
+        $this->process = new Process(trim($this->buildCommand(), '& '));
+        $this->process->start();
+
+        // Lock the process if preventOverlapping is set to True
+        if ($this->preventOverlapping) {
+            file_put_contents($this->lockFilePath(), $this->process->getPid());
+
+            // Delete the file when the task is completed
+            $this->after(function() {
+                $lock_file = $this->lockFilePath();
+                if (file_exists($lock_file)) {
+                    unlink($lock_file);
+                }
+            });
         }
 
-        (new Process(
-            trim($this->buildCommand(), '& ')
-        ))->run();
-
-
-        if (count($this->afterCallbacks)) {
-            $this->callAfterCallbacks($invoker);
-        }
+        return $this;
     }
 
      /**
@@ -180,11 +193,13 @@ class Event
      * @param  \Crunz\Invoker $invoker
      * @return void
      */
-    protected function callBeforeCallbacks(Invoker $invoker)
+    public function callBeforeCallbacks(Invoker $invoker)
     {
         foreach ($this->beforeCallbacks as $callback) {
             $invoker->call($callback);
         }
+
+        return $this;
     }
 
     /**
@@ -193,11 +208,13 @@ class Event
      * @param  \Crunz\Invoker $invoker
      * @return void
      */
-    protected function callAfterCallbacks(Invoker $invoker)
+    public function callAfterCallbacks(Invoker $invoker)
     {
         foreach ($this->afterCallbacks as $callback) {
             $invoker->call($callback);
         }
+
+        return $this;
     }
 
     /**
@@ -212,22 +229,23 @@ class Event
             $this->command = 'cd ' .  $this->cwd . '; ' . $this->command;
         }
 
-        $redirect = $this->shouldAppendOutput ? ' >> ' : ' > ';
-        $command  = $this->command . $redirect . $this->output . ' 2>&1 &';
-
+        //$redirect = $this->shouldAppendOutput ? ' >> ' : ' > ';
+        
+        $command  = $this->command;
+                
         return $this->user ? 'sudo -u ' . $this->user . ' ' . $command : $command;
     }
 
     /**
-    * Check if another instance of the event is still running
-    *
-    * @return boolean
-    */
-    public function islocked()
+     * Check if another instance of the event is still running
+     *
+     * @return boolean
+     */
+    public function isLocked()
     {
         $lock_file = $this->lockFilePath();
         
-        $pid       = file_exists($lock_file) ? trim(file_get_contents($lock_file)) : null;
+        $pid       = file_exists($lock_file) ? (int)trim(file_get_contents($lock_file)) : null;
 
         return (!is_null($pid) && posix_getsid($pid)) ? true : false;
    
@@ -377,7 +395,7 @@ class Event
         $segments = explode(':', $time);
 
         return $this->spliceIntoPosition(2, (int) $segments[0])
-                    ->spliceIntoPosition(1, count($segments) == 2 ? (int) $segments[1] : '0');
+                    ->spliceIntoPosition(1, count($segments) > 1 ? (int) $segments[1] : '0');
     }
 
     /**
@@ -403,18 +421,18 @@ class Event
         });
      }
 
-     /**
+    /**
      * Check if event should be off
      *
      * @param  string  $datetime
      * @return boolean
      */
-     public function to($datetime)
-     {          
+    public function to($datetime)
+    {          
         return $this->skip(function() use ($datetime) {
             return $this->past($datetime);
         });
-     }
+    }
 
     /**
      * Check if time hasn't arrived
@@ -422,10 +440,10 @@ class Event
      * @param  string  $time
      * @return boolean
      */
-     protected function notYet($datetime)
-     {  
+    protected function notYet($datetime)
+    {  
         return time() < strtotime($datetime);
-     }
+    }
 
     /**
      * Check if the time has passed
@@ -433,10 +451,10 @@ class Event
      * @param  string $time
      * @return boolean
      */
-     protected function past($datetime)
-     {
-        return time() > strtotime($datetime);
-     }
+    protected function past($datetime)
+    {
+       return time() > strtotime($datetime);
+    }
 
     /**
      * Schedule the event to run twice daily.
@@ -758,6 +776,39 @@ class Event
     {
         return $this->sendOutputTo($location, true);
     }
+
+    /**
+     * Log output to a file
+     *
+     * @param  string   $data
+     * @param  string   $output
+     * @param  boolean  $append
+     * @return $this
+     */
+    public function logOutput($data, $output = null, $append = true)
+    { 
+        if ($output == '/dev/null' || is_null($output)) {
+            return;
+        }
+
+        $flag = $append ? FILE_APPEND : 0;
+        file_put_contents($output, $data, $flag);
+
+        return $this;
+    }
+
+    /**
+     * Log event's output to the specified output file
+     *
+     * @param  string  $data
+     * @return $this
+     */
+    public function logEventOutput($data)
+    {
+        $this->logOutput($data, $this->output, $this->shouldAppendOutput);
+
+        return $this;
+    }
     
     /**
      * Register a callback to ping a given URL before the job runs.
@@ -875,6 +926,7 @@ class Event
             return $this;
         }
         
+        $value = $value == 1 ? '*' : '*/' . $value;
         return $this->spliceIntoPosition($this->fieldsPosition[$unit], $value)
                     ->applyMask($unit);
     }
@@ -904,11 +956,11 @@ class Event
     }
 
     /**
-    * Mask a cron expression
-    *
-    * @param  string $unit
-    * @return string
-    */
+     * Mask a cron expression
+     *
+     * @param  string $unit
+     * @return string
+     */
     protected function applyMask($unit) 
     {
         $cron = explode(' ', $this->expression);
@@ -921,12 +973,12 @@ class Event
     }
 
     /**
-    * Handling dynamic frequency methods
-    *
-    * @param  string $methodName
-    * @param  array  $params
-    * @return $this
-    */
+     * Handling dynamic frequency methods
+     *
+     * @param  string $methodName
+     * @param  array  $params
+     * @return $this
+     */
     public function __call($methodName, $params)
     {
         preg_match('/^every([A-Z][a-zA-Z]+)?(Minute|Hour|Day|Month)s?$/', $methodName, $matches);
@@ -935,22 +987,13 @@ class Event
             throw new \BadMethodCallException();
         }
 
-        $unit = strtolower($matches[2]);
+        $amount = !empty($matches[1]) ? word2number(split_camel($matches[1])) : 1;
         
-        if (!empty($matches[1]) && strtolower($matches[1]) != 'one') {                        
-            
-            $num = word2number(split_camel($matches[1]));
-            
-            if (!$num) {            
-                throw new \BadMethodCallException();
-            }
+        if (!$amount) {
+            throw new \BadMethodCallException();
+        }
 
-            return $this->every($unit, '*/' . $num); 
-
-        } else {           
-            return $this->every($unit, '*');
-        }  
-
+        return $this->every(strtolower($matches[2]), $amount);
     }
 
 }
