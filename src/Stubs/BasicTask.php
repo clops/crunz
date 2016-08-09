@@ -13,7 +13,6 @@
 
 use Crunz\Schedule;
 
-
 $scheduler = new Schedule();
 
 $scheduler->run('DummyCommand')
